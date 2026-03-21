@@ -1,11 +1,14 @@
 using System.Collections.ObjectModel;
 using System.IO;
 using System.Windows.Input;
-using System.Windows.Media;
 using Microsoft.Win32;
 using ASD4G.Infrastructure;
 using ASD4G.Models;
 using ASD4G.Services;
+using Brush = System.Windows.Media.Brush;
+using BrushConverter = System.Windows.Media.BrushConverter;
+using OpenFileDialog = Microsoft.Win32.OpenFileDialog;
+using SolidColorBrush = System.Windows.Media.SolidColorBrush;
 
 namespace ASD4G.ViewModels;
 

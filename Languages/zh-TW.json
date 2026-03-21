@@ -44,6 +44,8 @@
     "Overview.CurrentSetup": "目前設定",
     "Overview.On": "開啟",
     "Overview.Off": "關閉",
+    "Tray.Show": "顯示主視窗",
+    "Tray.Exit": "結束程式",
     "Status.Ready": "ASD4G 已就緒。",
     "Status.WaitingForProcess": "監聽已啟用，正在等待目標程式啟動。",
     "Status.MonitoringPaused": "監聽已暫停。",

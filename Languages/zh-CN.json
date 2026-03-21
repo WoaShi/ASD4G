@@ -44,6 +44,8 @@
     "Overview.CurrentSetup": "当前设置",
     "Overview.On": "开启",
     "Overview.Off": "关闭",
+    "Tray.Show": "显示主界面",
+    "Tray.Exit": "退出程序",
     "Status.Ready": "ASD4G 已就绪。",
     "Status.WaitingForProcess": "监听已启用，正在等待目标程序启动。",
     "Status.MonitoringPaused": "监听已暂停。",

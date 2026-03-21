@@ -6,12 +6,15 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
     <ApplicationIcon>Assets\app.ico</ApplicationIcon>
   </PropertyGroup>
 
   <ItemGroup>
     <None Remove="Assets\app.ico" />
+    <None Remove="Assets\app-light.png" />
     <Resource Include="Assets\app.ico" />
+    <Resource Include="Assets\app-light.png" />
 
     <None Update="Languages\*.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>

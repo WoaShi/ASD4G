@@ -6,12 +6,15 @@ public sealed class AutoStartService
 {
     private const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
     private const string AppName = "ASD4G";
+    public const string BackgroundLaunchArgument = "--background";
 
     public bool IsEnabled()
     {
         using var key = Registry.CurrentUser.OpenSubKey(RunKeyPath);
         var value = key?.GetValue(AppName) as string;
-        return string.Equals(value, BuildCommand(), StringComparison.OrdinalIgnoreCase);
+        var command = BuildCommand();
+        return !string.IsNullOrWhiteSpace(command) &&
+               string.Equals(value, command, StringComparison.OrdinalIgnoreCase);
     }
 
     public bool SetEnabled(bool enabled, out string? errorMessage)
@@ -19,10 +22,16 @@ public sealed class AutoStartService
         try
         {
             using var key = Registry.CurrentUser.CreateSubKey(RunKeyPath);
+            var command = BuildCommand();
 
             if (enabled)
             {
-                key.SetValue(AppName, BuildCommand());
+                if (string.IsNullOrWhiteSpace(command))
+                {
+                    throw new InvalidOperationException("Unable to resolve the current executable path.");
+                }
+
+                key.SetValue(AppName, command);
             }
             else
             {
@@ -47,8 +56,16 @@ public sealed class AutoStartService
         }
     }
 
+    public static bool ShouldStartHidden(IEnumerable<string> arguments)
+    {
+        return arguments.Any(argument =>
+            string.Equals(argument, BackgroundLaunchArgument, StringComparison.OrdinalIgnoreCase));
+    }
+
     private static string BuildCommand()
     {
-        return $"\"{Environment.ProcessPath}\"";
+        return string.IsNullOrWhiteSpace(Environment.ProcessPath)
+            ? string.Empty
+            : $"\"{Environment.ProcessPath}\" {BackgroundLaunchArgument}";
     }
 }

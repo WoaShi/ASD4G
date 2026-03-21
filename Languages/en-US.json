@@ -44,6 +44,8 @@
     "Overview.CurrentSetup": "Current setup",
     "Overview.On": "On",
     "Overview.Off": "Off",
+    "Tray.Show": "Show window",
+    "Tray.Exit": "Exit",
     "Status.Ready": "ASD4G is ready.",
     "Status.WaitingForProcess": "Monitoring is enabled and waiting for a target process.",
     "Status.MonitoringPaused": "Monitoring is paused.",
