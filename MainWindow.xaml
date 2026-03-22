@@ -128,7 +128,7 @@
                                             CornerRadius="12">
                                         <StackPanel>
                                             <TextBlock FontSize="15"
-                                                       FontWeight="SemiBold"
+                                                       FontWeight="Normal"
                                                        Text="{Binding Source={x:Static services:LocalizationService.Instance}, Path=[Sidebar.QuickView]}" />
                                             <TextBlock Margin="0,4,0,0"
                                                        FontSize="12"
@@ -203,9 +203,9 @@
         <Style x:Key="PageTitleStyle"
                TargetType="TextBlock">
             <Setter Property="FontSize"
-                    Value="30" />
+                    Value="28" />
             <Setter Property="FontWeight"
-                    Value="SemiBold" />
+                    Value="Normal" />
             <Setter Property="VerticalAlignment"
                     Value="Center" />
         </Style>
@@ -285,6 +285,16 @@
                                     <TextBlock Margin="0,6,0,0"
                                                Style="{StaticResource StateSecondaryValueTextStyle}"
                                                Text="{Binding OriginalResolutionText}" />
+                                    <StackPanel Margin="0,24,0,0"
+                                                Orientation="Horizontal">
+                                        <Button MinWidth="150"
+                                                Command="{Binding ApplyManualScalingCommand}"
+                                                Content="{Binding Source={x:Static services:LocalizationService.Instance}, Path=[Operation.ManualScaleOnButton]}" />
+                                        <Button MinWidth="168"
+                                                Margin="12,0,0,0"
+                                                Command="{Binding DisableManualScalingCommand}"
+                                                Content="{Binding Source={x:Static services:LocalizationService.Instance}, Path=[Operation.ManualScaleOffButton]}" />
+                                    </StackPanel>
                                 </StackPanel>
                             </GroupBox>
 
@@ -378,24 +388,40 @@
                                          SelectedItem="{Binding SelectedTargetProgram}">
                                     <ListBox.ItemTemplate>
                                         <DataTemplate>
-                                            <Grid Margin="0,2,0,2">
+                                            <Grid Margin="0,4,0,4">
                                                 <Grid.ColumnDefinitions>
                                                     <ColumnDefinition Width="28" />
                                                     <ColumnDefinition Width="*" />
+                                                    <ColumnDefinition Width="Auto" />
                                                 </Grid.ColumnDefinitions>
                                                 <Image Width="20"
                                                        Height="20"
                                                        VerticalAlignment="Center"
                                                        Source="{Binding Icon}"
                                                        Stretch="Uniform" />
-                                                <TextBlock Grid.Column="1"
-                                                           Margin="12,0,0,0"
+                                                <StackPanel Grid.Column="1"
+                                                            Margin="12,0,12,0">
+                                                    <TextBlock Text="{Binding DisplayName}" />
+                                                    <TextBlock Margin="0,2,0,0"
+                                                               FontSize="12"
+                                                               Opacity="0.68"
+                                                               Text="{Binding ExecutablePath}"
+                                                               TextTrimming="CharacterEllipsis" />
+                                                </StackPanel>
+                                                <TextBlock Grid.Column="2"
                                                            VerticalAlignment="Center"
-                                                           Text="{Binding ExecutablePath}" />
+                                                           Opacity="0.72"
+                                                           Text="{Binding TargetResolutionText}" />
                                             </Grid>
                                         </DataTemplate>
                                     </ListBox.ItemTemplate>
                                 </ListBox>
+
+                                <TextBlock Margin="0,12,0,0"
+                                           FontSize="12"
+                                           Opacity="0.68"
+                                           TextWrapping="Wrap"
+                                           Text="{Binding Source={x:Static services:LocalizationService.Instance}, Path=[Settings.TargetPriorityHint]}" />
                             </StackPanel>
                         </GroupBox>
 
@@ -408,6 +434,11 @@
                                 <TextBlock Margin="0,12,0,0"
                                            TextWrapping="Wrap"
                                            Text="{Binding Source={x:Static services:LocalizationService.Instance}, Path=[Settings.GpuHint]}" />
+                                <TextBlock Margin="0,14,0,0"
+                                           FontSize="12"
+                                           Opacity="0.68"
+                                           TextWrapping="Wrap"
+                                           Text="{Binding ResolutionEditorScopeText}" />
 
                                 <Grid Margin="0,18,0,0">
                                     <Grid.ColumnDefinitions>
@@ -419,7 +450,7 @@
                                         <TextBlock Style="{StaticResource CaptionTextStyle}"
                                                    Text="{Binding Source={x:Static services:LocalizationService.Instance}, Path=[Settings.WidthLabel]}" />
                                         <TextBox Margin="0,8,0,0"
-                                                 Text="{Binding TargetWidth, UpdateSourceTrigger=PropertyChanged}" />
+                                                 Text="{Binding TargetWidth, UpdateSourceTrigger=LostFocus}" />
                                     </StackPanel>
 
                                     <StackPanel Grid.Column="1"
@@ -427,7 +458,7 @@
                                         <TextBlock Style="{StaticResource CaptionTextStyle}"
                                                    Text="{Binding Source={x:Static services:LocalizationService.Instance}, Path=[Settings.HeightLabel]}" />
                                         <TextBox Margin="0,8,0,0"
-                                                 Text="{Binding TargetHeight, UpdateSourceTrigger=PropertyChanged}" />
+                                                 Text="{Binding TargetHeight, UpdateSourceTrigger=LostFocus}" />
                                     </StackPanel>
                                 </Grid>
 
@@ -447,6 +478,11 @@
                                     <ComboBoxItem Tag="2027x1140"
                                                   Content="{Binding Source={x:Static services:LocalizationService.Instance}, Path=[Settings.Preset3]}" />
                                 </ComboBox>
+
+                                <TextBlock Margin="0,12,0,0"
+                                           Foreground="{Binding ResolutionAvailabilityBrush}"
+                                           Text="{Binding ResolutionAvailabilityText}"
+                                           TextWrapping="Wrap" />
                             </StackPanel>
                         </GroupBox>
 

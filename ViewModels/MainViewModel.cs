@@ -1,6 +1,6 @@
 using System.Collections.ObjectModel;
 using System.IO;
-using System.Windows.Input;
+using System.Windows.Threading;
 using Microsoft.Win32;
 using ASD4G.Infrastructure;
 using ASD4G.Models;
@@ -25,8 +25,13 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private readonly AutoStartService _autoStartService;
     private readonly DisplayScalingService _displayScalingService;
     private readonly ProcessMonitorService _processMonitorService;
+    private readonly Dispatcher _dispatcher;
+    private readonly SemaphoreSlim _processStateGate = new(1, 1);
+    private readonly SemaphoreSlim _displaySnapshotGate = new(1, 1);
     private readonly RelayCommand _startMonitoringCommand;
     private readonly RelayCommand _stopMonitoringCommand;
+    private readonly RelayCommand _applyManualScalingCommand;
+    private readonly RelayCommand _disableManualScalingCommand;
     private readonly RelayCommand _addTargetProgramCommand;
     private readonly RelayCommand _removeTargetProgramCommand;
     private readonly RelayCommand<string> _applyPresetCommand;
@@ -35,10 +40,19 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private bool _autoStartEnabled;
     private bool _isMonitoringEnabled;
     private bool _isOperationPageSelected = true;
-    private int _targetWidth;
-    private int _targetHeight;
+    private bool _isDisposed;
+    private bool _isManualScalingOverrideActive;
+    private bool _suppressTargetProgramResolutionChanged;
+    private int _manualOverrideWidth;
+    private int _manualOverrideHeight;
+    private int _defaultTargetWidth;
+    private int _defaultTargetHeight;
     private string _statusMessageKey = "Status.Ready";
     private object[] _statusMessageArgs = [];
+    private string _currentResolutionText = string.Empty;
+    private string _originalResolutionText = string.Empty;
+    private string _resolutionAvailabilityText = string.Empty;
+    private Brush _resolutionAvailabilityBrush = WarningBrush;
 
     public MainViewModel(
         AppSettings settings,
@@ -54,32 +68,42 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _autoStartService = autoStartService;
         _displayScalingService = displayScalingService;
         _processMonitorService = processMonitorService;
+        _dispatcher = Dispatcher.CurrentDispatcher;
 
         TargetPrograms = [];
         _startMonitoringCommand = new RelayCommand(StartMonitoring, () => !_isMonitoringEnabled);
         _stopMonitoringCommand = new RelayCommand(StopMonitoringAndRestore, () => _isMonitoringEnabled || _displayScalingService.IsScalingApplied);
+        _applyManualScalingCommand = new RelayCommand(ApplyManualScaling, () => !_isDisposed);
+        _disableManualScalingCommand = new RelayCommand(DisableManualScaling, () => !_isDisposed && (_displayScalingService.IsScalingApplied || _isManualScalingOverrideActive));
         _addTargetProgramCommand = new RelayCommand(AddTargetProgram);
         _removeTargetProgramCommand = new RelayCommand(RemoveSelectedTargetProgram, () => SelectedTargetProgram is not null);
         _applyPresetCommand = new RelayCommand<string>(ApplyPreset);
 
-        foreach (var executablePath in settings.TargetPrograms
-                     .Where(File.Exists)
-                     .Select(Path.GetFullPath)
-                     .Distinct(StringComparer.OrdinalIgnoreCase))
-        {
-            TargetPrograms.Add(new TargetProgramItemViewModel(executablePath));
-        }
-
         _autoStartEnabled = settings.AutoStart;
         _isMonitoringEnabled = settings.MonitoringEnabled;
-        _targetWidth = settings.TargetWidth;
-        _targetHeight = settings.TargetHeight;
+        _defaultTargetWidth = Math.Max(1, settings.TargetWidth);
+        _defaultTargetHeight = Math.Max(1, settings.TargetHeight);
         _selectedLanguage = _localizationService.AvailableLanguages
             .FirstOrDefault(option => string.Equals(option.Code, settings.SelectedLanguage, StringComparison.OrdinalIgnoreCase))
             ?? _localizationService.AvailableLanguages.FirstOrDefault();
 
+        foreach (var configuredProgram in LoadConfiguredPrograms(settings))
+        {
+            var item = new TargetProgramItemViewModel(
+                configuredProgram.ExecutablePath,
+                configuredProgram.TargetWidth,
+                configuredProgram.TargetHeight);
+            item.ResolutionChanged += OnTargetProgramResolutionChanged;
+            TargetPrograms.Add(item);
+        }
+
+        if (TargetPrograms.Count > 0)
+        {
+            _selectedTargetProgram = TargetPrograms[0];
+        }
+
         _processMonitorService.ActiveProcessesChanged += OnActiveProcessesChanged;
-        _processMonitorService.UpdateTargets(TargetPrograms.Select(item => item.ExecutablePath));
+        _processMonitorService.UpdateTargets(BuildTargetProgramSettingsSnapshot());
 
         if (_isMonitoringEnabled)
         {
@@ -92,33 +116,48 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
 
         _localizationService.LanguageChanged += OnLanguageChanged;
+
         RefreshState();
+        _ = RefreshDisplaySnapshotAsync();
+        _ = HandleActiveProcessesChangedAsync();
     }
 
     public ObservableCollection<TargetProgramItemViewModel> TargetPrograms { get; }
 
     public IEnumerable<LanguageOption> AvailableLanguages => _localizationService.AvailableLanguages;
 
-    public ICommand StartMonitoringCommand => _startMonitoringCommand;
+    public RelayCommand StartMonitoringCommand => _startMonitoringCommand;
 
-    public ICommand StopMonitoringCommand => _stopMonitoringCommand;
+    public RelayCommand StopMonitoringCommand => _stopMonitoringCommand;
 
-    public ICommand AddTargetProgramCommand => _addTargetProgramCommand;
+    public RelayCommand AddTargetProgramCommand => _addTargetProgramCommand;
 
-    public ICommand RemoveTargetProgramCommand => _removeTargetProgramCommand;
+    public RelayCommand RemoveTargetProgramCommand => _removeTargetProgramCommand;
 
-    public ICommand ApplyPresetCommand => _applyPresetCommand;
+    public RelayCommand ApplyManualScalingCommand => _applyManualScalingCommand;
+
+    public RelayCommand DisableManualScalingCommand => _disableManualScalingCommand;
+
+    public RelayCommand<string> ApplyPresetCommand => _applyPresetCommand;
 
     public TargetProgramItemViewModel? SelectedTargetProgram
     {
         get => _selectedTargetProgram;
         set
         {
-            if (SetProperty(ref _selectedTargetProgram, value))
+            if (!SetProperty(ref _selectedTargetProgram, value))
             {
-                OnPropertyChanged(nameof(HasSelectedTargetProgram));
-                _removeTargetProgramCommand.RaiseCanExecuteChanged();
+                return;
             }
+
+            OnPropertyChanged(nameof(HasSelectedTargetProgram));
+            OnPropertyChanged(nameof(TargetWidth));
+            OnPropertyChanged(nameof(TargetHeight));
+            OnPropertyChanged(nameof(TargetResolutionText));
+            OnPropertyChanged(nameof(ResolutionEditorScopeText));
+            _removeTargetProgramCommand.RaiseCanExecuteChanged();
+            RefreshState();
+            _ = RefreshDisplaySnapshotAsync();
         }
     }
 
@@ -195,49 +234,45 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     public int TargetWidth
     {
-        get => _targetWidth;
-        set
-        {
-            if (SetProperty(ref _targetWidth, Math.Max(1, value)))
-            {
-                _settings.TargetWidth = _targetWidth;
-                SaveSettings();
-                RefreshState();
-                ReapplyScalingIfNeeded();
-            }
-        }
+        get => SelectedTargetProgram?.TargetWidth ?? _defaultTargetWidth;
+        set => UpdateResolutionConfiguration(Math.Max(1, value), TargetHeight);
     }
 
     public int TargetHeight
     {
-        get => _targetHeight;
-        set
-        {
-            if (SetProperty(ref _targetHeight, Math.Max(1, value)))
-            {
-                _settings.TargetHeight = _targetHeight;
-                SaveSettings();
-                RefreshState();
-                ReapplyScalingIfNeeded();
-            }
-        }
+        get => SelectedTargetProgram?.TargetHeight ?? _defaultTargetHeight;
+        set => UpdateResolutionConfiguration(TargetWidth, Math.Max(1, value));
     }
 
     public bool HasSelectedTargetProgram => SelectedTargetProgram is not null;
+
+    public string ResolutionEditorScopeText => SelectedTargetProgram is null
+        ? Translate("Settings.DefaultResolutionScope")
+        : _localizationService.TranslateFormat("Settings.SelectedProgramResolutionScope", SelectedTargetProgram.DisplayName);
 
     public string MonitorStateText => Translate(_isMonitoringEnabled ? "Status.MonitoringEnabled" : "Status.MonitoringDisabled");
 
     public string ScaleStateText => Translate(_displayScalingService.IsScalingApplied ? "Status.ScalingApplied" : "Status.ScalingIdle");
 
-    public string TargetResolutionText => $"{TargetWidth} x {TargetHeight}";
+    public string TargetResolutionText
+    {
+        get
+        {
+            var targetResolution = GetDisplayedTargetResolution();
+            return $"{targetResolution.Width} x {targetResolution.Height}";
+        }
+    }
 
-    public string CurrentResolutionText => FormatDisplayMode(_displayScalingService.GetCurrentMode());
+    public string CurrentResolutionText => _currentResolutionText;
 
-    public string OriginalResolutionText => FormatDisplayMode(_displayScalingService.OriginalMode);
+    public string OriginalResolutionText => _originalResolutionText;
 
     public string ActiveProcessesText => _processMonitorService.ActiveProcesses.Count == 0
         ? Translate("Status.NoActiveProcess")
-        : string.Join(Environment.NewLine, _processMonitorService.ActiveProcesses.Select(process => $"{process.ProcessName} ({process.ProcessId})"));
+        : string.Join(
+            Environment.NewLine,
+            _processMonitorService.ActiveProcesses.Select(process =>
+                $"{process.ProcessName} ({process.ProcessId})  [{process.TargetWidth} x {process.TargetHeight}]"));
 
     public string TargetProgramsCountText => _localizationService.TranslateFormat("Status.TargetProgramsCount", TargetPrograms.Count);
 
@@ -247,9 +282,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     public string SelectedLanguageText => SelectedLanguage?.DisplayName ?? Translate("Status.Unknown");
 
-    public string ResolutionAvailabilityText => Translate(_displayScalingService.IsTargetModeSupported(TargetWidth, TargetHeight)
-        ? "Status.TargetResolutionSupported"
-        : "Status.TargetResolutionUnsupported");
+    public string ResolutionAvailabilityText => _resolutionAvailabilityText;
 
     public string StatusMessage => _localizationService.TranslateFormat(_statusMessageKey, _statusMessageArgs);
 
@@ -257,25 +290,72 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     public Brush ScaleStateBrush => _displayScalingService.IsScalingApplied ? SuccessBrush : WarningBrush;
 
-    public Brush ResolutionAvailabilityBrush => _displayScalingService.IsTargetModeSupported(TargetWidth, TargetHeight)
-        ? SuccessBrush
-        : WarningBrush;
+    public Brush ResolutionAvailabilityBrush => _resolutionAvailabilityBrush;
 
     public void Dispose()
     {
+        if (_isDisposed)
+        {
+            return;
+        }
+
+        _isDisposed = true;
+        _isManualScalingOverrideActive = false;
         _processMonitorService.ActiveProcessesChanged -= OnActiveProcessesChanged;
         _processMonitorService.Dispose();
         _localizationService.LanguageChanged -= OnLanguageChanged;
+
+        foreach (var targetProgram in TargetPrograms)
+        {
+            targetProgram.ResolutionChanged -= OnTargetProgramResolutionChanged;
+        }
 
         if (_displayScalingService.IsScalingApplied)
         {
             _displayScalingService.RestoreResolution();
         }
+
+        _processStateGate.Dispose();
+        _displaySnapshotGate.Dispose();
+    }
+
+    private static IEnumerable<TargetProgramSetting> LoadConfiguredPrograms(AppSettings settings)
+    {
+        if (settings.TargetProgramSettings.Count > 0)
+        {
+            return settings.TargetProgramSettings
+                .Where(program => !string.IsNullOrWhiteSpace(program.ExecutablePath))
+                .Select(program => new TargetProgramSetting
+                {
+                    ExecutablePath = Path.GetFullPath(program.ExecutablePath),
+                    TargetWidth = Math.Max(1, program.TargetWidth),
+                    TargetHeight = Math.Max(1, program.TargetHeight)
+                })
+                .Where(program => File.Exists(program.ExecutablePath))
+                .DistinctBy(program => program.ExecutablePath, StringComparer.OrdinalIgnoreCase);
+        }
+
+        return settings.TargetPrograms
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .Select(Path.GetFullPath)
+            .Where(File.Exists)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Select(path => new TargetProgramSetting
+            {
+                ExecutablePath = path,
+                TargetWidth = Math.Max(1, settings.TargetWidth),
+                TargetHeight = Math.Max(1, settings.TargetHeight)
+            });
     }
 
     private void StartMonitoring()
     {
-        if (_isMonitoringEnabled)
+        _ = StartMonitoringAsync();
+    }
+
+    private async Task StartMonitoringAsync()
+    {
+        if (_isMonitoringEnabled || _isDisposed)
         {
             return;
         }
@@ -284,33 +364,128 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _settings.MonitoringEnabled = true;
         SaveSettings();
         _processMonitorService.Start();
-        SetStatusMessage("Status.WaitingForProcess");
-        RefreshState();
+
+        await _dispatcher.InvokeAsync(() =>
+        {
+            SetStatusMessage("Status.WaitingForProcess");
+            RefreshState();
+        });
+
+        await HandleActiveProcessesChangedAsync();
     }
 
     private void StopMonitoringAndRestore()
     {
-        if (!_isMonitoringEnabled && !_displayScalingService.IsScalingApplied)
+        _ = StopMonitoringAndRestoreAsync();
+    }
+
+    private async Task StopMonitoringAndRestoreAsync()
+    {
+        if ((!_isMonitoringEnabled && !_displayScalingService.IsScalingApplied) || _isDisposed)
         {
             return;
         }
 
         _isMonitoringEnabled = false;
+        _isManualScalingOverrideActive = false;
         _settings.MonitoringEnabled = false;
         SaveSettings();
         _processMonitorService.Stop();
 
+        var statusKey = "Status.MonitoringPaused";
         if (_displayScalingService.IsScalingApplied)
         {
-            var result = _displayScalingService.RestoreResolution();
-            SetStatusMessage(result.Success ? "Status.RestoredToOriginal" : "Status.RestoreFailed");
+            var result = await Task.Run(_displayScalingService.RestoreResolution);
+            statusKey = result.Success ? "Status.RestoredToOriginal" : "Status.RestoreFailed";
+        }
+
+        await _dispatcher.InvokeAsync(() =>
+        {
+            SetStatusMessage(statusKey);
+            RefreshState();
+        });
+
+        await RefreshDisplaySnapshotAsync();
+    }
+
+    private void ApplyManualScaling()
+    {
+        _ = ApplyManualScalingAsync();
+    }
+
+    private async Task ApplyManualScalingAsync()
+    {
+        if (_isDisposed)
+        {
+            return;
+        }
+
+        var targetWidth = TargetWidth;
+        var targetHeight = TargetHeight;
+        var previousOverrideEnabled = _isManualScalingOverrideActive;
+        var previousOverrideWidth = _manualOverrideWidth;
+        var previousOverrideHeight = _manualOverrideHeight;
+
+        var result = await Task.Run(() => _displayScalingService.ApplyResolution(targetWidth, targetHeight));
+        if (result.Success)
+        {
+            _isManualScalingOverrideActive = true;
+            _manualOverrideWidth = targetWidth;
+            _manualOverrideHeight = targetHeight;
         }
         else
         {
-            SetStatusMessage("Status.MonitoringPaused");
+            _isManualScalingOverrideActive = previousOverrideEnabled;
+            _manualOverrideWidth = previousOverrideWidth;
+            _manualOverrideHeight = previousOverrideHeight;
         }
 
-        RefreshState();
+        await _dispatcher.InvokeAsync(() =>
+        {
+            SetStatusMessage(
+                result.Success ? "Status.ManualScaleApplied" : MapDisplayFailure(result.Failure),
+                targetWidth,
+                targetHeight);
+            RefreshState();
+        });
+
+        await RefreshDisplaySnapshotAsync();
+    }
+
+    private void DisableManualScaling()
+    {
+        _ = DisableManualScalingAsync();
+    }
+
+    private async Task DisableManualScalingAsync()
+    {
+        if (_isDisposed)
+        {
+            return;
+        }
+
+        _isManualScalingOverrideActive = false;
+        _manualOverrideWidth = 0;
+        _manualOverrideHeight = 0;
+
+        string statusKey;
+        if (_displayScalingService.IsScalingApplied)
+        {
+            var result = await Task.Run(_displayScalingService.RestoreResolution);
+            statusKey = result.Success ? "Status.ManualScaleClosed" : "Status.RestoreFailed";
+        }
+        else
+        {
+            statusKey = _isMonitoringEnabled ? "Status.WaitingForProcess" : "Status.MonitoringPaused";
+        }
+
+        await _dispatcher.InvokeAsync(() =>
+        {
+            SetStatusMessage(statusKey);
+            RefreshState();
+        });
+
+        await RefreshDisplaySnapshotAsync();
     }
 
     private void AddTargetProgram()
@@ -331,19 +506,21 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         if (TargetPrograms.Any(item => string.Equals(item.ExecutablePath, normalizedPath, StringComparison.OrdinalIgnoreCase)))
         {
             SetStatusMessage("Status.TargetProgramExists");
+            RefreshState();
             return;
         }
 
-        var item = new TargetProgramItemViewModel(normalizedPath);
+        var item = new TargetProgramItemViewModel(normalizedPath, _defaultTargetWidth, _defaultTargetHeight);
+        item.ResolutionChanged += OnTargetProgramResolutionChanged;
         TargetPrograms.Add(item);
         SelectedTargetProgram = item;
 
-        _settings.TargetPrograms = TargetPrograms.Select(target => target.ExecutablePath).ToList();
-        SaveSettings();
-        _processMonitorService.UpdateTargets(TargetPrograms.Select(target => target.ExecutablePath));
+        PersistTargetPrograms();
+        _processMonitorService.UpdateTargets(BuildTargetProgramSettingsSnapshot());
 
         SetStatusMessage("Status.TargetProgramAdded", Path.GetFileName(normalizedPath));
         RefreshState();
+        _ = RefreshDisplaySnapshotAsync();
     }
 
     private void RemoveSelectedTargetProgram()
@@ -353,16 +530,24 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             return;
         }
 
-        var removedName = Path.GetFileName(SelectedTargetProgram.ExecutablePath);
-        TargetPrograms.Remove(SelectedTargetProgram);
-        SelectedTargetProgram = null;
+        var removedProgram = SelectedTargetProgram;
+        var removedName = Path.GetFileName(removedProgram.ExecutablePath);
+        removedProgram.ResolutionChanged -= OnTargetProgramResolutionChanged;
 
-        _settings.TargetPrograms = TargetPrograms.Select(target => target.ExecutablePath).ToList();
-        SaveSettings();
-        _processMonitorService.UpdateTargets(TargetPrograms.Select(target => target.ExecutablePath));
+        var removedIndex = TargetPrograms.IndexOf(removedProgram);
+        TargetPrograms.Remove(removedProgram);
+
+        SelectedTargetProgram = TargetPrograms.Count == 0
+            ? null
+            : TargetPrograms[Math.Clamp(removedIndex, 0, TargetPrograms.Count - 1)];
+
+        PersistTargetPrograms();
+        _processMonitorService.UpdateTargets(BuildTargetProgramSettingsSnapshot());
 
         SetStatusMessage("Status.TargetProgramRemoved", removedName);
         RefreshState();
+        _ = RefreshDisplaySnapshotAsync();
+        _ = HandleActiveProcessesChangedAsync();
     }
 
     private void ApplyPreset(string? payload)
@@ -380,74 +565,272 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             return;
         }
 
-        _targetWidth = width;
-        _targetHeight = height;
-        _settings.TargetWidth = width;
-        _settings.TargetHeight = height;
-        SaveSettings();
-
-        OnPropertyChanged(nameof(TargetWidth));
-        OnPropertyChanged(nameof(TargetHeight));
+        UpdateResolutionConfiguration(width, height);
         SetStatusMessage("Status.PresetApplied", width, height);
         RefreshState();
-        ReapplyScalingIfNeeded();
     }
 
-    private void ReapplyScalingIfNeeded()
+    private void UpdateResolutionConfiguration(int width, int height)
     {
-        if (!_displayScalingService.IsScalingApplied)
+        if (SelectedTargetProgram is not null)
         {
-            return;
-        }
-
-        var result = _displayScalingService.ApplyResolution(TargetWidth, TargetHeight);
-        if (!result.Success)
-        {
-            SetStatusMessage(MapDisplayFailure(result.Failure), TargetWidth, TargetHeight);
-        }
-
-        RefreshState();
-    }
-
-    private void OnActiveProcessesChanged(object? sender, EventArgs e)
-    {
-        if (!_isMonitoringEnabled)
-        {
-            RefreshState();
-            return;
-        }
-
-        if (_processMonitorService.ActiveProcesses.Count > 0)
-        {
-            if (!_displayScalingService.IsScalingApplied)
+            _suppressTargetProgramResolutionChanged = true;
+            try
             {
-                var result = _displayScalingService.ApplyResolution(TargetWidth, TargetHeight);
-                SetStatusMessage(
-                    result.Success ? "Status.ScaleApplied" : MapDisplayFailure(result.Failure),
-                    TargetWidth,
-                    TargetHeight);
+                SelectedTargetProgram.TargetWidth = width;
+                SelectedTargetProgram.TargetHeight = height;
             }
-            else
+            finally
             {
-                SetStatusMessage("Status.ProcessDetected");
+                _suppressTargetProgramResolutionChanged = false;
             }
-        }
-        else if (_displayScalingService.IsScalingApplied)
-        {
-            var result = _displayScalingService.RestoreResolution();
-            SetStatusMessage(result.Success ? "Status.RestoredAfterExit" : "Status.RestoreFailed");
+
+            _defaultTargetWidth = width;
+            _defaultTargetHeight = height;
+            _settings.TargetWidth = width;
+            _settings.TargetHeight = height;
+            PersistTargetPrograms();
         }
         else
         {
-            SetStatusMessage("Status.WaitingForProcess");
+            if (_defaultTargetWidth == width && _defaultTargetHeight == height)
+            {
+                return;
+            }
+
+            _defaultTargetWidth = width;
+            _defaultTargetHeight = height;
+            _settings.TargetWidth = width;
+            _settings.TargetHeight = height;
+            SaveSettings();
+        }
+
+        OnPropertyChanged(nameof(TargetWidth));
+        OnPropertyChanged(nameof(TargetHeight));
+        OnPropertyChanged(nameof(TargetResolutionText));
+        _ = RefreshDisplaySnapshotAsync();
+        _ = HandleActiveProcessesChangedAsync();
+    }
+
+    private async void OnActiveProcessesChanged(object? sender, EventArgs e)
+    {
+        await HandleActiveProcessesChangedAsync();
+    }
+
+    private async Task HandleActiveProcessesChangedAsync()
+    {
+        if (_isDisposed)
+        {
+            return;
+        }
+
+        await _processStateGate.WaitAsync();
+        try
+        {
+            if (!_isMonitoringEnabled)
+            {
+                if (_isManualScalingOverrideActive)
+                {
+                    await EnsureManualOverrideAppliedAsync();
+                }
+
+                await _dispatcher.InvokeAsync(RefreshState);
+                await RefreshDisplaySnapshotAsync();
+                return;
+            }
+
+            var activeProcesses = _processMonitorService.ActiveProcesses;
+            var activeTarget = activeProcesses
+                .OrderBy(process => process.TargetPriority)
+                .ThenBy(process => process.ProcessId)
+                .FirstOrDefault();
+
+            string statusKey;
+            object[] statusArgs = [];
+
+            if (activeTarget is not null)
+            {
+                var requiresReapply = !_displayScalingService.IsScalingApplied ||
+                                      !IsAppliedResolution(activeTarget.TargetWidth, activeTarget.TargetHeight);
+
+                if (requiresReapply)
+                {
+                    var result = await Task.Run(() => _displayScalingService.ApplyResolution(activeTarget.TargetWidth, activeTarget.TargetHeight));
+                    statusKey = result.Success ? "Status.ScaleApplied" : MapDisplayFailure(result.Failure);
+                    statusArgs = [activeTarget.TargetWidth, activeTarget.TargetHeight];
+                }
+                else
+                {
+                    statusKey = "Status.ProcessDetected";
+                }
+            }
+            else if (_isManualScalingOverrideActive)
+            {
+                await EnsureManualOverrideAppliedAsync();
+                statusKey = "Status.ManualScaleApplied";
+                statusArgs = [_manualOverrideWidth, _manualOverrideHeight];
+            }
+            else if (_displayScalingService.IsScalingApplied)
+            {
+                var result = await Task.Run(_displayScalingService.RestoreResolution);
+                statusKey = result.Success ? "Status.RestoredAfterExit" : "Status.RestoreFailed";
+            }
+            else
+            {
+                statusKey = "Status.WaitingForProcess";
+            }
+
+            await _dispatcher.InvokeAsync(() =>
+            {
+                SetStatusMessage(statusKey, statusArgs);
+                RefreshState();
+            });
+
+            await RefreshDisplaySnapshotAsync();
+        }
+        finally
+        {
+            _processStateGate.Release();
+        }
+    }
+
+    private async Task EnsureManualOverrideAppliedAsync()
+    {
+        if (!_isManualScalingOverrideActive || _manualOverrideWidth <= 0 || _manualOverrideHeight <= 0)
+        {
+            return;
+        }
+
+        if (_displayScalingService.IsScalingApplied && IsAppliedResolution(_manualOverrideWidth, _manualOverrideHeight))
+        {
+            return;
+        }
+
+        await Task.Run(() => _displayScalingService.ApplyResolution(_manualOverrideWidth, _manualOverrideHeight));
+    }
+
+    private void OnTargetProgramResolutionChanged(object? sender, EventArgs e)
+    {
+        if (_suppressTargetProgramResolutionChanged || sender is not TargetProgramItemViewModel targetProgram)
+        {
+            return;
+        }
+
+        _defaultTargetWidth = targetProgram.TargetWidth;
+        _defaultTargetHeight = targetProgram.TargetHeight;
+        _settings.TargetWidth = targetProgram.TargetWidth;
+        _settings.TargetHeight = targetProgram.TargetHeight;
+        PersistTargetPrograms();
+
+        if (ReferenceEquals(targetProgram, SelectedTargetProgram))
+        {
+            OnPropertyChanged(nameof(TargetWidth));
+            OnPropertyChanged(nameof(TargetHeight));
+            OnPropertyChanged(nameof(TargetResolutionText));
         }
 
         RefreshState();
+        _ = RefreshDisplaySnapshotAsync();
+        _ = HandleActiveProcessesChangedAsync();
     }
 
     private void OnLanguageChanged(object? sender, EventArgs e)
     {
         RefreshState();
+        _ = RefreshDisplaySnapshotAsync();
+    }
+
+    private void PersistTargetPrograms()
+    {
+        _settings.TargetProgramSettings = BuildTargetProgramSettingsSnapshot();
+        _settings.TargetPrograms = _settings.TargetProgramSettings
+            .Select(target => target.ExecutablePath)
+            .ToList();
+        SaveSettings();
+    }
+
+    private List<TargetProgramSetting> BuildTargetProgramSettingsSnapshot()
+    {
+        return TargetPrograms
+            .Select(target => target.ToSetting())
+            .ToList();
+    }
+
+    private async Task RefreshDisplaySnapshotAsync()
+    {
+        if (_isDisposed)
+        {
+            return;
+        }
+
+        await _displaySnapshotGate.WaitAsync();
+        try
+        {
+            var targetResolution = GetDisplayedTargetResolution();
+            var snapshot = await Task.Run(() => new DisplaySnapshot
+            {
+                CurrentMode = _displayScalingService.GetCurrentMode(),
+                OriginalMode = _displayScalingService.OriginalMode,
+                IsSupported = _displayScalingService.IsTargetModeSupported(targetResolution.Width, targetResolution.Height)
+            });
+
+            await _dispatcher.InvokeAsync(() =>
+            {
+                _currentResolutionText = FormatDisplayMode(snapshot.CurrentMode);
+                _originalResolutionText = FormatDisplayMode(snapshot.OriginalMode);
+                _resolutionAvailabilityText = Translate(snapshot.IsSupported
+                    ? "Status.TargetResolutionSupported"
+                    : "Status.TargetResolutionUnsupported");
+                _resolutionAvailabilityBrush = snapshot.IsSupported ? SuccessBrush : WarningBrush;
+
+                OnPropertyChanged(nameof(CurrentResolutionText));
+                OnPropertyChanged(nameof(OriginalResolutionText));
+                OnPropertyChanged(nameof(ResolutionAvailabilityText));
+                OnPropertyChanged(nameof(ResolutionAvailabilityBrush));
+                OnPropertyChanged(nameof(TargetResolutionText));
+            });
+        }
+        finally
+        {
+            _displaySnapshotGate.Release();
+        }
+    }
+
+    private (int Width, int Height) GetDisplayedTargetResolution()
+    {
+        var activeTarget = _processMonitorService.ActiveProcesses
+            .OrderBy(process => process.TargetPriority)
+            .ThenBy(process => process.ProcessId)
+            .FirstOrDefault();
+        if (activeTarget is not null)
+        {
+            return (activeTarget.TargetWidth, activeTarget.TargetHeight);
+        }
+
+        if (_isManualScalingOverrideActive && _manualOverrideWidth > 0 && _manualOverrideHeight > 0)
+        {
+            return (_manualOverrideWidth, _manualOverrideHeight);
+        }
+
+        if (SelectedTargetProgram is not null)
+        {
+            return (SelectedTargetProgram.TargetWidth, SelectedTargetProgram.TargetHeight);
+        }
+
+        if (TargetPrograms.Count > 0)
+        {
+            return (TargetPrograms[0].TargetWidth, TargetPrograms[0].TargetHeight);
+        }
+
+        return (_defaultTargetWidth, _defaultTargetHeight);
+    }
+
+    private bool IsAppliedResolution(int width, int height)
+    {
+        var appliedMode = _displayScalingService.AppliedMode;
+        return appliedMode is not null &&
+               appliedMode.Width == width &&
+               appliedMode.Height == height;
     }
 
     private void SaveSettings()
@@ -474,8 +857,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(MonitorStateBrush));
         OnPropertyChanged(nameof(ScaleStateBrush));
         OnPropertyChanged(nameof(ResolutionAvailabilityBrush));
+        OnPropertyChanged(nameof(ResolutionEditorScopeText));
         _startMonitoringCommand.RaiseCanExecuteChanged();
         _stopMonitoringCommand.RaiseCanExecuteChanged();
+        _applyManualScalingCommand.RaiseCanExecuteChanged();
+        _disableManualScalingCommand.RaiseCanExecuteChanged();
         _removeTargetProgramCommand.RaiseCanExecuteChanged();
     }
 
@@ -515,5 +901,14 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         var brush = (SolidColorBrush)new BrushConverter().ConvertFrom(colorCode)!;
         brush.Freeze();
         return brush;
+    }
+
+    private sealed class DisplaySnapshot
+    {
+        public DisplayMode? CurrentMode { get; init; }
+
+        public DisplayMode? OriginalMode { get; init; }
+
+        public bool IsSupported { get; init; }
     }
 }

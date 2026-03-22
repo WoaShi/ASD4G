@@ -12,5 +12,7 @@ public sealed class AppSettings
 
     public string SelectedLanguage { get; set; } = "zh-CN";
 
+    public List<TargetProgramSetting> TargetProgramSettings { get; set; } = [];
+
     public List<string> TargetPrograms { get; set; } = [];
 }
